@@ -1,0 +1,90 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# Authentication (RS256 JWT), scopes and tenant isolation (ADR-007, ADR-017).
+
+### 1. No token → 401 UNAUTHENTICATED (+ WWW-Authenticate: Bearer)
+GET {{api}}/programs/{{programUsd}}/availability
+
+> {%
+    client.test("401", () => {
+        client.assert(response.status === 401, "status " + response.status);
+        client.assert(response.body.code === "UNAUTHENTICATED", response.body.code);
+        client.assert(response.headers.valueOf("WWW-Authenticate") !== null, "WWW-Authenticate header");
+    });
+%}
+
+### 2. Expired token → 401
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{tokenExpired}}
+
+> {%
+    client.test("401", () => client.assert(response.status === 401, "status " + response.status));
+%}
+
+### 3. Garbage token → 401
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer not.a.jwt
+
+> {%
+    client.test("401", () => client.assert(response.status === 401, "status " + response.status));
+%}
+
+### 4. Read-only token can read…
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{tokenReadOnly}}
+
+> {%
+    client.test("200", () => client.assert(response.status === 200, "status " + response.status));
+%}
+
+### 5. …but cannot reserve → 403 INSUFFICIENT_SCOPE
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{tokenReadOnly}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-RO-{{$timestamp}}",
+  "amount": { "amountMinor": "1000", "currency": "USD" }
+}
+
+> {%
+    client.test("403 INSUFFICIENT_SCOPE", () => {
+        client.assert(response.status === 403, "status " + response.status);
+        client.assert(response.body.code === "INSUFFICIENT_SCOPE", response.body.code);
+    });
+%}
+
+### 6. Tenant t-2 has its OWN PRG-USD-001 ($2,500,000.00) — same id, different program
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{tokenTenant2}}
+
+> {%
+    client.test("t-2 sees its own limit", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(response.body.limit.amountMinor === "250000000", response.body.limit.amountMinor);
+    });
+%}
+
+### 7. t-1's EUR program does not exist for t-2 → 404, not 403 (doesn't reveal it exists)
+GET {{api}}/programs/{{programEur}}/availability
+Authorization: Bearer {{tokenTenant2}}
+
+> {%
+    client.test("404 PROGRAM_NOT_FOUND", () => {
+        client.assert(response.status === 404, "status " + response.status);
+        client.assert(response.body.code === "PROGRAM_NOT_FOUND", response.body.code);
+    });
+%}
+
+### 8. Correlation id: send your own, get it echoed back (and in logs, the ledger and Kafka headers)
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{token}}
+X-Correlation-Id: phpstorm-demo-{{$timestamp}}
+
+> {%
+    client.test("echoed", () => {
+        const id = response.headers.valueOf("X-Correlation-Id");
+        client.assert(id !== null && id.startsWith("phpstorm-demo-"), "got " + id);
+    });
+%}

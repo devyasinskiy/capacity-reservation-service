@@ -1,0 +1,69 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# Multi-currency reservations and the read endpoints (keyset pagination).
+
+### 1. GBP invoice into the EUR program (cross rate derived from the stub's USD table)
+POST {{api}}/programs/{{programEur}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-GBP-{{$timestamp}}",
+  "amount": { "amountMinor": "2500000", "currency": "GBP" }
+}
+
+> {%
+    client.test("201, converted to EUR", () => {
+        client.assert(response.status === 201, "status " + response.status);
+        client.assert(response.body.programAmount.currency === "EUR");
+    });
+%}
+
+### 2. USD invoice into the JPY program (JPY has 0 decimals: amountMinor is whole yen)
+POST {{api}}/programs/{{programJpy}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-USD-{{$timestamp}}",
+  "amount": { "amountMinor": "123456", "currency": "USD" }
+}
+
+> {%
+    client.test("201, converted to JPY", () => {
+        client.assert(response.status === 201, "status " + response.status);
+        client.assert(response.body.programAmount.currency === "JPY");
+    });
+%}
+
+### 3. Availability of the JPY program
+GET {{api}}/programs/{{programJpy}}/availability
+Authorization: Bearer {{token}}
+
+### 4. List reservations, first page of 2 (newest first)
+GET {{api}}/programs/{{programUsd}}/reservations?limit=2
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("page shape", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(Array.isArray(response.body.items), "items array");
+    });
+    client.global.set("nextCursor", response.body.nextCursor ?? "");
+%}
+
+### 5. Next page, using the cursor from the previous response (run 4 first)
+GET {{api}}/programs/{{programUsd}}/reservations?limit=2&cursor={{nextCursor}}
+Authorization: Bearer {{token}}
+
+### 6. Filter by status: ACTIVE | PARTIALLY_RELEASED | RELEASED
+GET {{api}}/programs/{{programUsd}}/reservations?status=RELEASED&limit=10
+Authorization: Bearer {{token}}
+
+### 7. Live availability (Server-Sent Events)
+# The response stays open: run this, then reserve something in another request and watch an `availability` event arrive.
+# A `heartbeat` event comes every 15s. Stop it with the ■ button.
+GET {{api}}/programs/{{programUsd}}/availability/stream
+Authorization: Bearer {{token}}
+Accept: text/event-stream

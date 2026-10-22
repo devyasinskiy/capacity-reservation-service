@@ -1,0 +1,32 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# Internal management port (ADR-016): no auth here, and NOT exposed on the public port.
+
+### 1. Liveness: the process is up (never checks dependencies)
+GET {{management}}/health/live
+
+> {%
+    client.test("200", () => client.assert(response.status === 200, "status " + response.status));
+%}
+
+### 2. Readiness: Postgres + Kafka consumer reachable (503 when either is down)
+GET {{management}}/health/ready
+
+### 3. Prometheus metrics (capacity_*, http_*, kafka lag, Node runtime)
+GET {{management}}/metrics
+
+### 4. OpenAPI spec (Swagger UI is at {{management}}/docs in a browser)
+GET {{management}}/docs/openapi.json
+
+> {%
+    client.test("OpenAPI 3", () => client.assert(response.body.openapi.startsWith("3."), response.body.openapi));
+%}
+
+### 5. Health is not on the public port → 404 (no route matches, so the JWT guard never runs)
+GET {{apiHost}}/health/live
+
+> {%
+    client.test("not on the public port", () => client.assert(response.status === 401 || response.status === 404,
+        "status " + response.status));
+%}

@@ -1,0 +1,47 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# Audit endpoints (scope capacity:audit).
+# To produce discrepancies, publish treasury snapshots first (Kafka can't be driven from here):
+#   npm run publish -- snapshot --program PRG-USD-001 --parts 3 --omit 1
+# Run it twice: PENDING after one snapshot, OPEN after the second (ADR-011).
+
+### 1. Ledger: append-only movements, newest first; reservedDelta values sum to `reserved`
+GET {{api}}/programs/{{programUsd}}/ledger?limit=10
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("200", () => client.assert(response.status === 200, "status " + response.status));
+    client.global.set("ledgerCursor", response.body.nextCursor ?? "");
+%}
+
+### 2. Ledger, next page (run 1 first)
+GET {{api}}/programs/{{programUsd}}/ledger?limit=10&cursor={{ledgerCursor}}
+Authorization: Bearer {{token}}
+
+### 3. All discrepancies
+GET {{api}}/programs/{{programUsd}}/discrepancies
+Authorization: Bearer {{token}}
+
+### 4. Only the ones flagged for review (reproduced by two consecutive snapshots)
+GET {{api}}/programs/{{programUsd}}/discrepancies?status=OPEN
+Authorization: Bearer {{token}}
+
+### 5. Seen once so far (may still be timing noise)
+GET {{api}}/programs/{{programUsd}}/discrepancies?status=PENDING
+Authorization: Bearer {{token}}
+
+### 6. Resolved by a later snapshot
+GET {{api}}/programs/{{programUsd}}/discrepancies?status=CLEARED
+Authorization: Bearer {{token}}
+
+### 7. Ledger without the audit scope → 403 INSUFFICIENT_SCOPE
+GET {{api}}/programs/{{programUsd}}/ledger
+Authorization: Bearer {{tokenNoAudit}}
+
+> {%
+    client.test("403", () => {
+        client.assert(response.status === 403, "status " + response.status);
+        client.assert(response.body.code === "INSUFFICIENT_SCOPE", response.body.code);
+    });
+%}

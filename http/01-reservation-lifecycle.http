@@ -1,0 +1,164 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# The happy path, end to end. Run the whole file top to bottom (▶▶ in the gutter):
+# each request saves what the next one needs (reservationId, invoiceId) into client.global.
+# Every run uses a fresh invoice id, so the file can be re-run any number of times.
+
+### 1. Availability before (capacity:read)
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("200 with money as minor-unit strings", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(typeof response.body.available.amountMinor === "string", "amountMinor must be a string");
+        client.assert(response.body.currency === "USD");
+    });
+    client.global.set("availableBefore", response.body.available.amountMinor);
+%}
+
+### 2. Reserve a €100,000.00 invoice in the USD program (FX locked, rounded up — ADR-003/004)
+< {%
+    const suffix = Date.now();
+    client.global.set("invoiceId", "INV-HTTP-" + suffix);
+    client.global.set("reserveKey", "http-reserve-" + suffix);
+%}
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{reserveKey}}
+
+{
+  "invoiceId": "{{invoiceId}}",
+  "amount": { "amountMinor": "10000000", "currency": "EUR" }
+}
+
+> {%
+    client.test("201 Created with a locked FX rate", () => {
+        client.assert(response.status === 201, "status " + response.status);
+        client.assert(response.headers.valueOf("Location") !== null, "Location header");
+        client.assert(response.body.programAmount.amountMinor === "10825000", "€100k × 1.0825 = $108,250.00");
+        client.assert(response.body.fx.source === "STUB");
+        client.assert(response.body.status === "ACTIVE");
+    });
+    client.global.set("reservationId", response.body.id);
+%}
+
+### 3. Retry with the same Idempotency-Key → the stored response is replayed, nothing reserved twice
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{reserveKey}}
+
+{
+  "invoiceId": "{{invoiceId}}",
+  "amount": { "amountMinor": "10000000", "currency": "EUR" }
+}
+
+> {%
+    client.test("replayed, same reservation", () => {
+        client.assert(response.status === 201, "original status is replayed");
+        client.assert(response.headers.valueOf("Idempotent-Replayed") === "true", "Idempotent-Replayed header");
+        client.assert(response.body.id === client.global.get("reservationId"), "same id");
+    });
+%}
+
+### 4. Retry WITHOUT a key → still idempotent by invoiceId (200 + replay header)
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "{{invoiceId}}",
+  "amount": { "amountMinor": "10000000", "currency": "EUR" }
+}
+
+> {%
+    client.test("replay by invoice id", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(response.body.id === client.global.get("reservationId"), "same id");
+    });
+%}
+
+### 5. Get the reservation (includes the FX lock: rate, source, asOf)
+GET {{api}}/programs/{{programUsd}}/reservations/{{reservationId}}
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("200", () => client.assert(response.status === 200, "status " + response.status));
+%}
+
+### 6. Partial repayment of €40,000.00 → frees the pro-rata share, rounded down (ADR-004)
+< {% client.global.set("releaseKey1", "http-release-1-" + Date.now()); %}
+POST {{api}}/programs/{{programUsd}}/reservations/{{reservationId}}/releases
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{releaseKey1}}
+
+{
+  "amount": { "amountMinor": "4000000", "currency": "EUR" }
+}
+
+> {%
+    client.test("partially released", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(response.body.release.freedProgramAmount.amountMinor === "4330000", "40% of $108,250.00");
+        client.assert(response.body.reservation.status === "PARTIALLY_RELEASED");
+    });
+%}
+
+### 7. Same release, same key → replayed (no second release)
+POST {{api}}/programs/{{programUsd}}/reservations/{{reservationId}}/releases
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{releaseKey1}}
+
+{
+  "amount": { "amountMinor": "4000000", "currency": "EUR" }
+}
+
+> {%
+    client.test("replayed", () => {
+        client.assert(response.headers.valueOf("Idempotent-Replayed") === "true", "Idempotent-Replayed header");
+        client.assert(response.body.reservation.releasedInvoiceAmount.amountMinor === "4000000", "still only €40k released");
+    });
+%}
+
+### 8. Final repayment: no body → releases exactly what remains
+< {% client.global.set("releaseKey2", "http-release-2-" + Date.now()); %}
+POST {{api}}/programs/{{programUsd}}/reservations/{{reservationId}}/releases
+Authorization: Bearer {{token}}
+Idempotency-Key: {{releaseKey2}}
+
+> {%
+    client.test("fully released, remainder freed exactly", () => {
+        client.assert(response.status === 200, "status " + response.status);
+        client.assert(response.body.release.freedProgramAmount.amountMinor === "6495000", "$108,250.00 − $43,300.00");
+        client.assert(response.body.reservation.status === "RELEASED");
+        client.assert(response.body.reservation.outstandingProgramAmount.amountMinor === "0");
+    });
+%}
+
+### 9. Availability after → back where we started
+GET {{api}}/programs/{{programUsd}}/availability
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("capacity fully returned", () => {
+        client.assert(response.body.available.amountMinor === client.global.get("availableBefore"),
+            "expected " + client.global.get("availableBefore") + ", got " + response.body.available.amountMinor);
+    });
+%}
+
+### 10. Release again → 409 RESERVATION_ALREADY_RELEASED
+POST {{api}}/programs/{{programUsd}}/reservations/{{reservationId}}/releases
+Authorization: Bearer {{token}}
+Idempotency-Key: http-release-again-{{$timestamp}}
+
+> {%
+    client.test("409 already released", () => {
+        client.assert(response.status === 409, "status " + response.status);
+        client.assert(response.body.code === "RESERVATION_ALREADY_RELEASED", response.body.code);
+    });
+%}

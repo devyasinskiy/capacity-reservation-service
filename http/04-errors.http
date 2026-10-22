@@ -1,0 +1,221 @@
+# Before running: pick the `local` environment in the "Run with" selector at the top of the editor,
+# and run `npm run http:tokens` once. Without an environment, variables like api and token stay unresolved.
+#
+# Every error is RFC 9457 application/problem+json with a stable `code` and the correlationId (ADR-015).
+# Run the whole file: each request asserts its status and code.
+
+### 1. Over the limit → 409 INSUFFICIENT_CAPACITY
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-HUGE-{{$timestamp}}",
+  "amount": { "amountMinor": "999999999999", "currency": "USD" }
+}
+
+> {%
+    client.test("409 INSUFFICIENT_CAPACITY", () => {
+        client.assert(response.status === 409, "status " + response.status);
+        client.assert(response.body.code === "INSUFFICIENT_CAPACITY", response.body.code);
+        client.assert(response.contentType.mimeType === "application/problem+json", response.contentType.mimeType);
+    });
+%}
+
+### 2a. Set-up for the conflict cases: a fresh reservation of $1,000.00
+< {%
+    const suffix = Date.now();
+    client.global.set("errInvoiceId", "INV-ERR-" + suffix);
+    client.global.set("errReserveKey", "http-err-" + suffix);
+%}
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{errReserveKey}}
+
+{
+  "invoiceId": "{{errInvoiceId}}",
+  "amount": { "amountMinor": "100000", "currency": "USD" }
+}
+
+> {%
+    client.test("201", () => client.assert(response.status === 201, "status " + response.status));
+    client.global.set("errReservationId", response.body.id);
+%}
+
+### 2b. Same invoice, different amount → 409 RESERVATION_CONFLICT
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "{{errInvoiceId}}",
+  "amount": { "amountMinor": "200000", "currency": "USD" }
+}
+
+> {%
+    client.test("409 RESERVATION_CONFLICT", () => {
+        client.assert(response.status === 409, "status " + response.status);
+        client.assert(response.body.code === "RESERVATION_CONFLICT", response.body.code);
+    });
+%}
+
+### 2c. Same Idempotency-Key, different body → 422 IDEMPOTENCY_KEY_REUSED
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: {{errReserveKey}}
+
+{
+  "invoiceId": "{{errInvoiceId}}-other",
+  "amount": { "amountMinor": "100000", "currency": "USD" }
+}
+
+> {%
+    client.test("422 IDEMPOTENCY_KEY_REUSED", () => {
+        client.assert(response.status === 422, "status " + response.status);
+        client.assert(response.body.code === "IDEMPOTENCY_KEY_REUSED", response.body.code);
+    });
+%}
+
+### 2d. Release more than the invoice amount → 422 OVER_RELEASE
+POST {{api}}/programs/{{programUsd}}/reservations/{{errReservationId}}/releases
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: http-over-{{$timestamp}}
+
+{
+  "amount": { "amountMinor": "100001", "currency": "USD" }
+}
+
+> {%
+    client.test("422 OVER_RELEASE", () => {
+        client.assert(response.status === 422, "status " + response.status);
+        client.assert(response.body.code === "OVER_RELEASE", response.body.code);
+    });
+%}
+
+### 2e. Release in another currency than the invoice → 422 CURRENCY_MISMATCH
+POST {{api}}/programs/{{programUsd}}/reservations/{{errReservationId}}/releases
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: http-mismatch-{{$timestamp}}
+
+{
+  "amount": { "amountMinor": "1000", "currency": "EUR" }
+}
+
+> {%
+    client.test("422 CURRENCY_MISMATCH", () => {
+        client.assert(response.status === 422, "status " + response.status);
+        client.assert(response.body.code === "CURRENCY_MISMATCH", response.body.code);
+    });
+%}
+
+### 2f. Release without an Idempotency-Key → 400 IDEMPOTENCY_KEY_REQUIRED
+POST {{api}}/programs/{{programUsd}}/reservations/{{errReservationId}}/releases
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("400 IDEMPOTENCY_KEY_REQUIRED", () => {
+        client.assert(response.status === 400, "status " + response.status);
+        client.assert(response.body.code === "IDEMPOTENCY_KEY_REQUIRED", response.body.code);
+    });
+%}
+
+### 2g. Clean-up: release the set-up reservation so it doesn't hold capacity
+POST {{api}}/programs/{{programUsd}}/reservations/{{errReservationId}}/releases
+Authorization: Bearer {{token}}
+Idempotency-Key: http-cleanup-{{$timestamp}}
+
+### 3. Unsupported currency → 422 CURRENCY_NOT_SUPPORTED
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-XYZ-{{$timestamp}}",
+  "amount": { "amountMinor": "1000", "currency": "XYZ" }
+}
+
+> {%
+    client.test("422 CURRENCY_NOT_SUPPORTED", () => {
+        client.assert(response.status === 422, "status " + response.status);
+        client.assert(response.body.code === "CURRENCY_NOT_SUPPORTED", response.body.code);
+    });
+%}
+
+### 4. Amount as a JSON number (floats are never accepted) → 400 VALIDATION_FAILED
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-FLOAT-{{$timestamp}}",
+  "amount": { "amountMinor": 1000.5, "currency": "USD" }
+}
+
+> {%
+    client.test("400 VALIDATION_FAILED", () => {
+        client.assert(response.status === 400, "status " + response.status);
+        client.assert(response.body.code === "VALIDATION_FAILED", response.body.code);
+    });
+%}
+
+### 5. Zero amount → 400 INVALID_AMOUNT (a domain rule, not a DTO rule)
+POST {{api}}/programs/{{programUsd}}/reservations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "invoiceId": "INV-ZERO-{{$timestamp}}",
+  "amount": { "amountMinor": "0", "currency": "USD" }
+}
+
+> {%
+    client.test("400 INVALID_AMOUNT", () => {
+        client.assert(response.status === 400, "status " + response.status);
+        client.assert(response.body.code === "INVALID_AMOUNT", response.body.code);
+    });
+%}
+
+### 6. Unknown program → 404 PROGRAM_NOT_FOUND
+GET {{api}}/programs/PRG-NOPE-404/availability
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("404 PROGRAM_NOT_FOUND", () => {
+        client.assert(response.status === 404, "status " + response.status);
+        client.assert(response.body.code === "PROGRAM_NOT_FOUND", response.body.code);
+    });
+%}
+
+### 7. Unknown reservation → 404 RESERVATION_NOT_FOUND
+GET {{api}}/programs/{{programUsd}}/reservations/00000000-0000-4000-8000-000000000000
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("404 RESERVATION_NOT_FOUND", () => {
+        client.assert(response.status === 404, "status " + response.status);
+        client.assert(response.body.code === "RESERVATION_NOT_FOUND", response.body.code);
+    });
+%}
+
+### 8. Malformed reservation id → 400 VALIDATION_FAILED
+GET {{api}}/programs/{{programUsd}}/reservations/not-a-uuid
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("400", () => client.assert(response.status === 400, "status " + response.status));
+%}
+
+### 9. Tampered pagination cursor → 400 INVALID_CURSOR
+GET {{api}}/programs/{{programUsd}}/reservations?cursor=garbage
+Authorization: Bearer {{token}}
+
+> {%
+    client.test("400 INVALID_CURSOR", () => {
+        client.assert(response.status === 400, "status " + response.status);
+        client.assert(response.body.code === "INVALID_CURSOR", response.body.code);
+    });
+%}
